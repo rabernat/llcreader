@@ -69,6 +69,18 @@ def _facet_to_faces(data, nfacet):
         data_rs = data.reshape(new_shape)
     return data_rs
 
+def _faces_to_facets(data):
+    # returns a list of facets
+    nz, nf, ny, nx = data.shape
+    assert nf == _nfaces
+    facets = []
+    for nfacet, (strides, reshape) in enumerate(zip(_facet_strides, _facet_reshape)):
+        # todo: use duck typing
+        fdata = dsa.concatenate(data[:, slice(*strides)], axis=1)[:, None]
+        if reshape
+        fdata = np.moveaxis(fdata, 3, 2)
+        
+        
 
 class LLCDataRequest:
 
