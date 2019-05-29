@@ -1,4 +1,5 @@
 import numpy as np
+import dask
 import dask.array as dsa
 import xarray as xr
 
@@ -27,70 +28,6 @@ def _get_var_metadata():
 _VAR_METADATA = _get_var_metadata()
 
 
-def _reshape_2d_llc_data(data, jdim):
-    """Transform flat 2D LLC file to 13-face version."""
-    # vendored from xmitgcm
-    # https://github.com/xgcm/xmitgcm/blob/master/xmitgcm/utils.py
-
-    LLC_NUM_FACES = 13
-    nside = data.shape[jdim] // LLC_NUM_FACES
-    # how the LLC data is laid out along the j dimension
-    strides = ((0,3), (3,6), (6,7), (7,10), (10,13))
-    # whether to reshape each face
-    reshape = (False, False, False, True, True)
-    # this will slice the data into 5 facets
-    slices = [jdim * (slice(None),) + (slice(nside*st[0], nside*st[1]),)
-              for st in strides]
-    facet_arrays = [data[sl] for sl in slices]
-    face_arrays = []
-    for ar, rs, st in zip(facet_arrays, reshape, strides):
-        nfaces_in_facet = st[1] - st[0]
-        shape = list(ar.shape)
-        if rs:
-            # we assume the other horizontal dimension is immediately after jdim
-            shape[jdim] = ar.shape[jdim+1]
-            shape[jdim+1] = ar.shape[jdim]
-        # insert a length-1 dimension along which to concatenate
-        shape.insert(jdim, 1)
-        ar.shape = shape
-        # now ar is propery shaped, but we still need to slice it into 13 faces
-        face_slice_dim = jdim + 1 + rs
-        for n in range(nfaces_in_facet):
-            face_slice = (face_slice_dim * (slice(None),) +
-                          (slice(nside*n, nside*(n+1)),))
-            data_face = ar[face_slice]
-            face_arrays.append(data_face)
-
-    return np.concatenate(face_arrays, axis=jdim)
-
-
-def _load_level_from_3D_field(fs, path offset, count, dtype):
-    #inum_str = '%010d' % inum
-    #fname = os.path.join(ddir, inum_str,
-    #                     '%s.%s.data.shrunk' % (varname, inum_str))
-    #with open(fname, mode='rb') as file:
-    #    file.seek(offset * dtype.itemsize)
-    #    data = np.fromfile(file, dtype=dtype, count=count)
-
-    file = fs.open(path)
-    file.seek(offset * dtype.itemsize)
-    buffer = file.read(length=count)
-    data = np.frombuffer(buffer, dtype=dtype)
-
-    data_blank = np.full_like(mask, np.nan, dtype=dtype)
-    data_blank[mask] = data
-    data_blank.shape = mask.shape
-    data_llc = _reshape_llc_data(data_blank, jdim=0).compute(get=dask.get)
-    data_llc.shape = (1,) + data_llc.shape
-    return data_llc
-
-
-def _lazily_load_level_from_3D_field(file, offset, count, mask, dtype):
-    return dsa.from_delayed(dask.delayed(load_level_from_3D_field)
-                            (file, offset, count, mask, dtype),
-                            (1, nface, ny, nx), dtype)
-
-
 def _decompress(data, mask):
     data_blank = np.full_like(mask, np.nan, dtype=dtype)
     data_blank[mask] = data
@@ -114,86 +51,118 @@ def _uncompressed_facet_index(nfacet, nside):
 def _facet_shape(nfacet, nside):
     facet_length = _facet_strides[nfacet][1] - _facet_strides[nfacet][0]
     if _facet_reshape[nfacet]:
-        facet_shape = (1, 1, nx, facet_length*nside)
+        facet_shape = (1, 1, nside, facet_length*nside)
     else:
         facet_shape = (1, 1, facet_length*nside, nside)
     return facet_shape
 
+def _facet_to_faces(data, nfacet):
+    nz, nf, ny, nx = data.shape
+    assert nf == 1
+    facet_length = _facet_strides[nfacet][1] - _facet_strides[nfacet][0]
+    if _facet_reshape[nfacet]:
+        new_shape = nz, ny, facet_length, nx / facet_length
+        data_rs = data.reshape(new_shape)
+        data_rs = np.moveaxis(data_rs, 2, 1) # dask-safe
+    else:
+        new_shape = nz, facet_length, ny / facet_length, nx
+        data_rs = data.reshape(new_shape)
+    return data_rs
 
-def _build_facet_chunk(fs, path, dtype, nk, nx, nfacet,
-                       klevels=[0], index=None, mask=None):
-    """Create numpy data from a file
 
-    Parameters
-    ----------
-    fs : fsspec.Filesystem
-    path : str
-    file_shape : tuple of ints
-        The shape of the data in the file
-    dtype : numpy.dtype
-        Data type of the data in the file
-    nfacet : int
-        Which facet to read
-    levels : int or lits of ints, optional
-        Which k levels to read
-    index : dict
-    mask : dask.array
+class LLCDataRequest:
 
-    Returns
-    -------
-    out : np.ndarray
-        The data
-    """
+    def __init__(self, fs, path, dtype, nk, nx,
+                 klevels=[0], index=None, mask=None):
+        """Create numpy data from a file
 
-    file = fs.open(path)
+        Parameters
+        ----------
+        fs : fsspec.Filesystem
+        path : str
+        file_shape : tuple of ints
+            The shape of the data in the file
+        dtype : numpy.dtype
+            Data type of the data in the file
+        nfacet : int
+            Which facet to read
+        levels : int or lits of ints, optional
+            Which k levels to read
+        index : dict
+        mask : dask.array
 
-    assert (nfacet >= 0) & (nfacet < 5)
-    facet_shape = _facet_shape(nfacet, nx)
+        Returns
+        -------
+        out : np.ndarray
+            The data
+        """
 
-    level_data = []
-    for k in klevels:
-        assert (k >= 0) & (k < nk)
+        self.fs = fs
+        self.path = path
+        self.dtype = dtype
+        self.nk = nk
+        self.nx = nx
+        self.klevels = klevels
+        self.mask = mask
+        self.index = index
 
-        # figure out where in the file we have to read to get the data
-        # for this level and facet
-        if index:
-            start, end = index[k][nfacet]
-        else:
-            level_start = k * nx * nx * _nfaces
-            facet_start, facet_end = _uncompressed_facet_index(nfacet, nx)
-            start = level_start + facet_start
-            end = level_start + facet_end
 
-        read_offset = start * dtype.itemsize # in bytes
-        read_length  = (end - start) * dtype.itemsize # in bytes
-        file.seek(read_offset)
-        buffer = file.read(read_length)
-        data = np.frombuffer(buffer, dtype=dtype)
+    def _build_facet_chunk(self, nfacet):
 
-        if mask:
-            data = _decompress(data, mask)
+        assert (nfacet >= 0) & (nfacet < 5)
 
-        # this is the shape this facet is supposed to have
-        data.shape = facet_shape
-        level_data.append(data)
+        file = self.fs.open(self.path)
+        facet_shape = _facet_shape(nfacet, self.nx)
 
-    return np.concatenate(level_data, axis=0)
+        level_data = []
+        for k in self.klevels:
+            assert (k >= 0) & (k < self.nk)
 
-def _lazily_build_facet_chunk(fs, path, dtype, nk, nx, nfacet,
-                              klevels=[0], index=None, mask=None):
-    facet_shape = _facet_shape(nfacet, nx)
-    shape = (len(klevels),) + facet_shape[1:]
-    print(shape)
-    return dsa.from_delayed(dask.delayed(_build_facet_chunk)
-                            (fs, path, dtype, nk, nx, nfacet,
-                              klevels=klevels, index=index, mask=mask),
-                            shape, dtype)s
+            # figure out where in the file we have to read to get the data
+            # for this level and facet
+            if self.index:
+                start, end = self.index[k][nfacet]
+            else:
+                level_start = k * self.nx**2 * _nfaces
+                facet_start, facet_end = _uncompressed_facet_index(nfacet, self.nx)
+                start = level_start + facet_start
+                end = level_start + facet_end
+
+            read_offset = start * self.dtype.itemsize # in bytes
+            read_length  = (end - start) * self.dtype.itemsize # in bytes
+            file.seek(read_offset)
+            buffer = file.read(read_length)
+            data = np.frombuffer(buffer, dtype=self.dtype)
+
+            if self.mask:
+                data = _decompress(data, self.mask)
+
+            # this is the shape this facet is supposed to have
+            data.shape = facet_shape
+            level_data.append(data)
+
+        return np.concatenate(level_data, axis=0)
+
+    def _lazily_build_facet_chunk(self, nfacet):
+        facet_shape = _facet_shape(nfacet, self.nx)
+        shape = (len(self.klevels),) + facet_shape[1:]
+        return dsa.from_delayed(dask.delayed(self._build_facet_chunk)(nfacet),
+                                shape, self.dtype)
+
+    # from this function we have several options for building datasets
+    def faces(self):
+        all_faces = []
+        for nfacet in range(5):
+            datad = self._lazily_build_facet_chunk(nfacet)
+            data_rs = _facet_to_faces(datad, nfacet)
+            all_faces.append(data_rs)
+        return dsa.concatenate(all_faces, axis=1)
 
 
 class BaseLLCModel:
-    self.nz = 90
-    self.nface = 13
-    self.dtype = np.dtype('>f4')
+    nz = 90
+    nface = 13
+    dtype = np.dtype('>f4')
 
     def __init__(self, datastore, mask_ds):
         self.store = datastore
@@ -284,10 +253,10 @@ class BaseLLCModel:
         return ds
 
 class LLC4320Model(BaseLLCModel):
-    self.nx = 4320
-    self.delta_t = 25
-    self.iter_start = 10368
-    self.iter_stop = 1310544 + 1
-    self.iter_step = 144
-    self.time_units='seconds since 2011-09-10'
-    self.variables = ['']
+    nx = 4320
+    delta_t = 25
+    iter_start = 10368
+    iter_stop = 1310544 + 1
+    iter_step = 144
+    time_units='seconds since 2011-09-10'
+    variables = ['']
