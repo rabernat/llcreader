@@ -91,9 +91,37 @@ def _lazily_load_level_from_3D_field(file, offset, count, mask, dtype):
                             (1, nface, ny, nx), dtype)
 
 
+def _decompress(data, mask):
+    data_blank = np.full_like(mask, np.nan, dtype=dtype)
+    data_blank[mask] = data
+    data_blank.shape = mask.shape
+    return data.blank
 
-def _build_facet_chunk(fs, path, file_shape, which_facets=None,
-                       which_levels=None):
+
+
+_facet_strides = ((0,3), (3,6), (6,7), (7,10), (10,13))
+# whether to reshape each face
+_facet_reshape = (False, False, False, True, True)
+_nfaces = 13
+
+
+def _uncompressed_facet_index(nfacet, nside):
+    face_size = nside**2
+    start = _facet_strides[nfacet][0] * face_size
+    end = _facet_strides[nfacet][1] * face_size
+    return start, end
+
+def _facet_shape(nfacet, nside):
+    facet_length = _facet_strides[nfacet][1] - _facet_strides[nfacet][0]
+    if _facet_reshape[nfacet]:
+        facet_shape = (1, 1, nx, facet_length*nside)
+    else:
+        facet_shape = (1, 1, facet_length*nside, nside)
+    return facet_shape
+
+
+def _build_facet_chunk(fs, path, dtype, nk, nx, nfacet,
+                       klevels=[0], index=None, mask=None):
     """Create numpy data from a file
 
     Parameters
@@ -102,10 +130,14 @@ def _build_facet_chunk(fs, path, file_shape, which_facets=None,
     path : str
     file_shape : tuple of ints
         The shape of the data in the file
-    which_facets : int or list of ints, optional
-        Which facets to read
-    which_levels : int or lits of ints, optional
+    dtype : numpy.dtype
+        Data type of the data in the file
+    nfacet : int
+        Which facet to read
+    levels : int or lits of ints, optional
         Which k levels to read
+    index : dict
+    mask : dask.array
 
     Returns
     -------
@@ -113,11 +145,49 @@ def _build_facet_chunk(fs, path, file_shape, which_facets=None,
         The data
     """
 
-    assert len(file_shape) == 4, 'file_shape should have length of 4'
-    nk, nface, ny, nx = file_shape
-    
+    file = fs.open(path)
 
+    assert (nfacet >= 0) & (nfacet < 5)
+    facet_shape = _facet_shape(nfacet, nx)
 
+    level_data = []
+    for k in klevels:
+        assert (k >= 0) & (k < nk)
+
+        # figure out where in the file we have to read to get the data
+        # for this level and facet
+        if index:
+            start, end = index[k][nfacet]
+        else:
+            level_start = k * nx * nx * _nfaces
+            facet_start, facet_end = _uncompressed_facet_index(nfacet, nx)
+            start = level_start + facet_start
+            end = level_start + facet_end
+
+        read_offset = start * dtype.itemsize # in bytes
+        read_length  = (end - start) * dtype.itemsize # in bytes
+        file.seek(read_offset)
+        buffer = file.read(read_length)
+        data = np.frombuffer(buffer, dtype=dtype)
+
+        if mask:
+            data = _decompress(data, mask)
+
+        # this is the shape this facet is supposed to have
+        data.shape = facet_shape
+        level_data.append(data)
+
+    return np.concatenate(level_data, axis=0)
+
+def _lazily_build_facet_chunk(fs, path, dtype, nk, nx, nfacet,
+                              klevels=[0], index=None, mask=None):
+    facet_shape = _facet_shape(nfacet, nx)
+    shape = (len(klevels),) + facet_shape[1:]
+    print(shape)
+    return dsa.from_delayed(dask.delayed(_build_facet_chunk)
+                            (fs, path, dtype, nk, nx, nfacet,
+                              klevels=klevels, index=index, mask=mask),
+                            shape, dtype)s
 
 
 class BaseLLCModel:
