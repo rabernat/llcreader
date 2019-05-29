@@ -79,8 +79,12 @@ def _faces_to_facets(data):
         fdata = dsa.concatenate(data[:, slice(*strides)], axis=1)[:, None]
         if reshape
         fdata = np.moveaxis(fdata, 3, 2)
-        
-        
+
+
+def _rotate_scalar_facet(facet):
+    facet_transposed = facet.transpose(0, 1, 3, 2)
+    facet_rotated = np.flip(facet_transposed, 2)
+    return facet_rotated
 
 class LLCDataRequest:
 
@@ -162,14 +166,23 @@ class LLCDataRequest:
                                 shape, self.dtype)
 
     # from this function we have several options for building datasets
+    def facets(self):
+        return [self._lazily_build_facet_chunk(nfacet) for nfacet in range(5)]
+
     def faces(self):
         all_faces = []
-        for nfacet in range(5):
-            datad = self._lazily_build_facet_chunk(nfacet)
-            data_rs = _facet_to_faces(datad, nfacet)
+        for nfacet, data_facet in enumerate(self.facets()):
+            data_rs = _facet_to_faces(data_facet, nfacet)
             all_faces.append(data_rs)
         return dsa.concatenate(all_faces, axis=1)
 
+
+    def latlon(self):
+
+        all_facets = self.facets()
+        rotated = (all_facets[:2]
+                   + [_rotate_scalar_facet(facet) for facet in all_facets[-2:]])
+        return dsa.concatenate(rotated, axis=3)
 
 class BaseLLCModel:
     nz = 90
