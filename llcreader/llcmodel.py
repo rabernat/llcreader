@@ -28,11 +28,11 @@ def _get_var_metadata():
 _VAR_METADATA = _get_var_metadata()
 
 
-def _decompress(data, mask):
+def _decompress(data, mask, dtype):
     data_blank = np.full_like(mask, np.nan, dtype=dtype)
     data_blank[mask] = data
     data_blank.shape = mask.shape
-    return data.blank
+    return data_blank
 
 
 
@@ -40,7 +40,7 @@ _facet_strides = ((0,3), (3,6), (6,7), (7,10), (10,13))
 # whether to reshape each face
 _facet_reshape = (False, False, False, True, True)
 _nfaces = 13
-
+_nfacets = 5
 
 def _uncompressed_facet_index(nfacet, nside):
     face_size = nside**2
@@ -75,10 +75,15 @@ def _faces_to_facets(data):
     assert nf == _nfaces
     facets = []
     for nfacet, (strides, reshape) in enumerate(zip(_facet_strides, _facet_reshape)):
-        # todo: use duck typing
-        fdata = dsa.concatenate(data[:, slice(*strides)], axis=1)[:, None]
-        if reshape
-        fdata = np.moveaxis(fdata, 3, 2)
+        face_data = [data[:, slice(nface, nface+1)] for nface in range(*strides)]
+        if reshape:
+            concat_axis = 3
+        else:
+            concat_axis = 2
+        # todo: use duck typing for concat
+        facet_data = dsa.concatenate(face_data, axis=concat_axis)
+        facets.append(facet_data)
+    return facets
 
 
 def _rotate_scalar_facet(facet):
@@ -125,7 +130,7 @@ class LLCDataRequest:
 
     def _build_facet_chunk(self, nfacet):
 
-        assert (nfacet >= 0) & (nfacet < 5)
+        assert (nfacet >= 0) & (nfacet < _nfacets)
 
         file = self.fs.open(self.path)
         facet_shape = _facet_shape(nfacet, self.nx)
@@ -137,7 +142,9 @@ class LLCDataRequest:
             # figure out where in the file we have to read to get the data
             # for this level and facet
             if self.index:
-                start, end = self.index[k][nfacet]
+                i = np.ravel_multi_index((k, nfacet), (self.nk, _nfacets))
+                start = self.index[i]
+                end = self.index[i+1]
             else:
                 level_start = k * self.nx**2 * _nfaces
                 facet_start, facet_end = _uncompressed_facet_index(nfacet, self.nx)
@@ -151,7 +158,8 @@ class LLCDataRequest:
             data = np.frombuffer(buffer, dtype=self.dtype)
 
             if self.mask:
-                data = _decompress(data, self.mask)
+                this_mask = self.mask[nfacet][k].compute()
+                data = _decompress(data, this_mask, self.dtype)
 
             # this is the shape this facet is supposed to have
             data.shape = facet_shape
