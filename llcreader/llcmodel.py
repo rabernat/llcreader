@@ -132,7 +132,11 @@ class LLCDataRequest:
 
         assert (nfacet >= 0) & (nfacet < _nfacets)
 
-        file = self.fs.open(self.path)
+        try:
+            # workaround for ecco data portal
+            file = self.fs.open(self.path, size_policy='get')
+        except TypeError:
+            file = self.fs.open(self.path)
         facet_shape = _facet_shape(nfacet, self.nx)
 
         level_data = []
@@ -145,6 +149,7 @@ class LLCDataRequest:
                 i = np.ravel_multi_index((k, nfacet), (self.nk, _nfacets))
                 start = self.index[i]
                 end = self.index[i+1]
+                print('start, end', start, end)
             else:
                 level_start = k * self.nx**2 * _nfaces
                 facet_start, facet_end = _uncompressed_facet_index(nfacet, self.nx)
@@ -156,6 +161,7 @@ class LLCDataRequest:
             file.seek(read_offset)
             buffer = file.read(read_length)
             data = np.frombuffer(buffer, dtype=self.dtype)
+            assert len(data) == (end - start)
 
             if self.mask:
                 this_mask = self.mask[nfacet][k].compute()
