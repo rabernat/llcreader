@@ -94,6 +94,13 @@ def _facet_to_faces(data, nfacet):
         data_rs = data.reshape(new_shape)
     return data_rs
 
+def _facets_to_faces(facets):
+    all_faces = []
+    for nfacet, data_facet in enumerate(facets):
+        data_rs = _facet_to_faces(data_facet, nfacet)
+        all_faces.append(data_rs)
+    return dsa.concatenate(all_faces, axis=1)
+
 def _faces_to_facets(data, facedim=-3):
     assert data.shape[facedim] == _nfaces
     facets = []
@@ -180,6 +187,15 @@ def _drop_facedim(dims):
     dims = list(dims)
     dims.remove('face')
     return dims
+
+def _add_face_to_dims(dims):
+    if 'j'in dims or 'j_g' in dims:
+        new_dims = dims.copy()
+        j_dim = dims.index('j')
+        new_dims.inset('face', j_dim)
+        return new_dims
+    else:
+        return dims
 
 def _faces_coords_to_latlon(ds):
     coords = ds.reset_coords().coords.to_dataset()
@@ -286,7 +302,7 @@ def _all_facets_to_latlon(data_facets, meta):
     data = {}
     for vname in scalars:
         data[vname] = _facet_to_latlon_scalar(data_facets[vname])
-        
+
     for vname_u, vname_v in vector_pairs:
         data_u, data_v = _facet_to_latlon_vector(data_facets[vname_u],
                                                  data_facets[vname_v])
@@ -386,25 +402,9 @@ class _LLCDataRequest:
         return dsa.from_delayed(dask.delayed(self.build_facet_chunk)(nfacet),
                                 shape, self.dtype)
 
-    # from this function we have several options for building datasets
     def facets(self):
         return [self.lazily_build_facet_chunk(nfacet) for nfacet in range(5)]
 
-
-    def faces(self):
-        all_faces = []
-        for nfacet, data_facet in enumerate(self.facets()):
-            data_rs = _facet_to_faces(data_facet, nfacet)
-            all_faces.append(data_rs)
-        return dsa.concatenate(all_faces, axis=1)
-
-
-    def latlon(self):
-
-        all_facets = self.facets()
-        rotated = (all_facets[:2]
-                   + [_rotate_scalar_facet(facet) for facet in all_facets[-2:]])
-        return dsa.concatenate(rotated, axis=3)
 
 
 class BaseLLCModel:
@@ -460,28 +460,20 @@ class BaseLLCModel:
 
 
     def _get_facet_data(self, varname, iters, k=levels):
-        # look up metadata?
-
         mask, index = self.get_mask_and_index_for_variable(varname)
-
-        data_iters = []
+        # needs facets to be outer index of nested lists
+        data_iters = 5 * [[],]
         for iternum in iters:
             fs, path = self.store.get_fs_and_full_path(self, varname, iternum)
             dr = _LLCDataRequest(fs, path, self.dtype, self.nk, self.nx,
                                  mask=mask, index=index, klevels=klevels)
-            if type=='faces':
-                data_iter = dr.facets()
-            elif type=='latlon'
-                data_iter = dr.latlon()
-            else:
-                raise ValueError('`type` must be either "faces" or "latlon"')
-            # insert a new axis for time at the beginning
-            data_iters.append(data_iter[None])
+            data_facets = dr.facets()
+            for n in range(5):
+                # insert a new axis for time at the beginning
+                data_iters[n].append(data_facets[n][None])
 
-        # concatenate over time
-        data = dsa.concatenate(data_iters, axis=0)
-
-
+        data = [dsa.concatenate(facet, axis=0) for facet in data_iters]
+        return data
 
 
     def get_dataset(variables, iter_start=None, iter_stop=None,
@@ -516,7 +508,6 @@ class BaseLLCModel:
         ds = self._make_coords_faces()
         if type=='latlon':
             ds = _faces_coords_to_lalon(ds)
-        coord_vars = list(ds.coords)
 
         if varnames is None:
             varnames = self.varnames
@@ -533,49 +524,18 @@ class BaseLLCModel:
         transformer = data_transformers[type]
         data = transformer(data_facets, _VAR_METADATA)
 
-        if type=='faces':
-            data = _all_facets_to_faces(data_facets)
-        elif type=='latlon':
-
-
-        vector_pairs = []
-        scalars = []
+        variables = {}
         for vname in varnames:
-            meta = _VAR_METADATA[varname]
-            if 'mate' in meta['attrs']:
-                mate = meta['attrs']['mate']
-                vector_pairs.append((vname, mate))
-                varnames.remove(mate)
+            meta = _VAR_METADATA[vname]
+            dims = meta['dims']
+            if type=='latlon':
+                dims = _add_face_to_dims[dims]
+            attrs = meta['attrs']
+            variables[vname] = xr.Variable(dims, data[vname], attrs)
 
-        all_vector_components = [inner for outer in (vector_pairs + metric_vector_pairs)
-                                 for inner in outer]
-        scalars = [vname for vname in vnames if vname not in all_vector_components]
-        data_vars = {}
+        ds = ds.update(data_vars)
+        return ds
 
-        for vname in scalars:
-            if vname=='face' or vname in ds_new:
-                continue
-            if 'face' in ds[vname].dims:
-                data = _faces_to_latlon_scalar(ds[vname].data)
-                dims = _drop_facedim(ds[vname].dims)
-            else:
-                data = ds[vname].data
-                dims = ds[vname].dims
-            data_vars[vname] = xr.Variable(dims, data, ds[vname].attrs)
-
-        for vname_u, vname_v in vector_pairs:
-            data_u, data_v = _faces_to_latlon_vector(ds[vname_u].data, ds[vname_v].data)
-            data_vars[vname_u] = xr.Variable(_drop_facedim(ds[vname_u].dims), data_u, ds[vname_u].attrs)
-            data_vars[vname_v] = xr.Variable(_drop_facedim(ds[vname_v].dims), data_v, ds[vname_v].attrs)
-        for vname_u, vname_v in metric_vector_pairs:
-            data_u, data_v = _faces_to_latlon_vector(ds[vname_u].data, ds[vname_v].data, metric=True)
-            data_vars[vname_u] = xr.Variable(_drop_facedim(ds[vname_u].dims), data_u, ds[vname_u].attrs)
-            data_vars[vname_v] = xr.Variable(_drop_facedim(ds[vname_v].dims), data_v, ds[vname_v].attrs)
-
-
-        ds_new = ds_new.update(data_vars)
-        ds_new = ds_new.set_coords([c for c in coord_vars if c in ds_new])
-        return ds_new
 
 class LLC4320Model(BaseLLCModel):
     nx = 4320
