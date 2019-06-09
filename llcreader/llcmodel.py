@@ -28,6 +28,31 @@ def _get_var_metadata():
 _VAR_METADATA = _get_var_metadata()
 
 
+def _get_scalars_and_vectors(varnames, type):
+
+    for vname in varnames:
+        if vname not in _VAR_METADATA:
+            raise ValueError("Varname `%s` not found in metadata." % vname)
+
+    if type != 'latlon':
+        return varnames, []
+
+    scalars = []
+    vector_pairs = []
+    for vname in varnames:
+        meta = _VAR_METADATA[vname]
+        try:
+            mate = meta['attrs']['mate']
+            if mate not in varnames:
+                raise ValueError("Vector pairs are required to create "
+                                 "latlon type datasets. Varname `%s` is "
+                                 "missing its vector mate `%s`"
+                                 % vname, mate)
+            vector_pairs.append((vname, mate))
+            varnames.remove(mate)
+        except KeyError:
+            scalars.append(vname)
+
 def _decompress(data, mask, dtype):
     data_blank = np.full_like(mask, np.nan, dtype=dtype)
     data_blank[mask] = data
@@ -91,7 +116,24 @@ def _rotate_scalar_facet(facet):
     facet_rotated = np.flip(facet_transposed, 2)
     return facet_rotated
 
-class LLCDataRequest:
+
+def _facets_to_latlon_scalar(all_facets):
+    rotated = (all_facets[:2]
+               + [_rotate_scalar_facet(facet) for facet in all_facets[-2:]])
+    return dsa.concatenate(rotated, axis=3)
+
+
+def _facets_to_latlon_vector(facets_u, facets_v):
+    u_rot = (facets_u[:2]
+             + [_rotate_scalar_facet(facet) for facet in facets_v[-2:]])
+    v_rot = (facets_v[:2]
+             + [-_rotate_scalar_facet(facet) for facet in facets_u[-2:]])
+    u = dsa.concatenate(u_rot, axis=3)
+    v = dsa.concatenate(v_rot, axis=3)
+    return u, v
+
+
+class _LLCDataRequest:
 
     def __init__(self, fs, path, dtype, nk, nx,
                  klevels=[0], index=None, mask=None):
@@ -128,7 +170,7 @@ class LLCDataRequest:
         self.index = index
 
 
-    def _build_facet_chunk(self, nfacet):
+    def build_facet_chunk(self, nfacet):
 
         assert (nfacet >= 0) & (nfacet < _nfacets)
 
@@ -173,15 +215,16 @@ class LLCDataRequest:
 
         return np.concatenate(level_data, axis=0)
 
-    def _lazily_build_facet_chunk(self, nfacet):
+    def lazily_build_facet_chunk(self, nfacet):
         facet_shape = _facet_shape(nfacet, self.nx)
         shape = (len(self.klevels),) + facet_shape[1:]
-        return dsa.from_delayed(dask.delayed(self._build_facet_chunk)(nfacet),
+        return dsa.from_delayed(dask.delayed(self.build_facet_chunk)(nfacet),
                                 shape, self.dtype)
 
     # from this function we have several options for building datasets
     def facets(self):
-        return [self._lazily_build_facet_chunk(nfacet) for nfacet in range(5)]
+        return [self.lazily_build_facet_chunk(nfacet) for nfacet in range(5)]
+
 
     def faces(self):
         all_faces = []
@@ -198,12 +241,21 @@ class LLCDataRequest:
                    + [_rotate_scalar_facet(facet) for facet in all_facets[-2:]])
         return dsa.concatenate(rotated, axis=3)
 
+
 class BaseLLCModel:
     nz = 90
     nface = 13
     dtype = np.dtype('>f4')
 
     def __init__(self, datastore, mask_ds):
+        """Initialize model
+
+        Parameters
+        ----------
+        datastore : llcreader.BaseStore
+        mask_ds : zarr.Group
+            Must contain variables `mask_c`, `masc_w`, `mask_s`
+        """
         self.store = datastore
         self.shape = (self.nz, self.nface, self.nx, self.nx)
         self.masks = self._get_masks(mask_ds)
@@ -219,7 +271,7 @@ class BaseLLCModel:
             self.masks[point] = data
 
 
-    def _make_coords(self):
+    def _make_coords_faces(self):
         all_iters = np.arange(self.iter_start, self.iter_stop, self.iter_step)
         time = self.delta_t * all_iters
         coords = {'face': ('face', np.arange(self.nface)),
@@ -237,31 +289,34 @@ class BaseLLCModel:
         return xr.decode_cf(xr.Dataset(coords=coords))
 
 
-    def _make_data_variable(self, varname, iters, k=0, point='C'):
+    def _get_facet_data(self, varname, iters, k=levels, type='faces'):
         # look up metadata?
 
-        shape = (1, self.nface, self.ny, self.nz)
-        dtype = self.dtype
-        strides = [0,] + list(ds_index['hFac' + point].data)
-        offset = strides[k]
-        count = strides[k+1]
-        mask = self._mask[point]
+        mask, index = self.get_mask_and_index_for_variable(varname)
 
-        # TODO
-        try:
-            mask_future = client.scatter(mask)
-        except NameError:
-            mask_future = mask
+        data_iters = []
+        for iternum in iters:
+            fs, path = self.store.get_fs_and_full_path(self, varname, iternum)
+            dr = _LLCDataRequest(fs, path, self.dtype, self.nk, self.nx,
+                                 mask=mask, index=index, klevels=klevels)
+            if type=='faces':
+                data_iter = dr.facets()
+            elif type=='latlon'
+                data_iter = dr.latlon()
+            else:
+                raise ValueError('`type` must be either "faces" or "latlon"')
+            # insert a new axis for time at the beginning
+            data_iters.append(data_iter[None])
 
-        data = dsa.concatenate([_lazily_load_level_from_3D_field
-                                (varname, i, offset, count, mask_future, dtype)
-                                for i in all_iters], axis=0)
+        # concatenate over time
+        data = dsa.concatenate(data_iters, axis=0)
 
-        return data
+        meta = _VAR_METADATA[varname]
 
 
     def get_dataset(variables, iter_start=None, iter_stop=None,
-                    iter_step=None, k_levels=None, k_chunksize=1):
+                    iter_step=None, k_levels=None, k_chunksize=1,
+                    type='faces'):
         """
         Create an xarray Dataset object for this model.
 
@@ -287,6 +342,15 @@ class BaseLLCModel:
         iters = np.arange(iter_start, iter_stop, iter_step)
 
         ds = self._make_coords()
+
+        scalars = []
+        vector_pairs = []
+        scalars, vector_pairs = _get_scalars_and_vectors(varnames, type)
+
+        for vname in scalars:
+            facets =
+
+
         for vname in variables:
             ds[vname] = self._make_data_variable(vname, iters, k=0)
         return ds

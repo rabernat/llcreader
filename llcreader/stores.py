@@ -30,6 +30,7 @@ class BaseStore:
         fs, path = self.get_fs_and_full_path(varname, iternum)
         return fs.open(path)
 
+
 class NestedStore(BaseStore):
     """Store where the variable are stored in subdirectories according to
     iteration number."""
