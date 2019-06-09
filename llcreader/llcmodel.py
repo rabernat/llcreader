@@ -94,17 +94,16 @@ def _facet_to_faces(data, nfacet):
         data_rs = data.reshape(new_shape)
     return data_rs
 
-def _faces_to_facets(data):
-    # returns a list of facets
-    nz, nf, ny, nx = data.shape
-    assert nf == _nfaces
+def _faces_to_facets(data, facedim=-3):
+    assert data.shape[facedim] == _nfaces
     facets = []
     for nfacet, (strides, reshape) in enumerate(zip(_facet_strides, _facet_reshape)):
-        face_data = [data[:, slice(nface, nface+1)] for nface in range(*strides)]
+        face_data = [data[(...,) + (slice(nface, nface+1), slice(None), slice(None))]
+                     for nface in range(*strides)]
         if reshape:
-            concat_axis = 3
+            concat_axis = facedim + 2
         else:
-            concat_axis = 2
+            concat_axis = facedim + 1
         # todo: use duck typing for concat
         facet_data = dsa.concatenate(face_data, axis=concat_axis)
         facets.append(facet_data)
@@ -112,26 +111,192 @@ def _faces_to_facets(data):
 
 
 def _rotate_scalar_facet(facet):
-    facet_transposed = facet.transpose(0, 1, 3, 2)
-    facet_rotated = np.flip(facet_transposed, 2)
+    facet_transposed = np.moveaxis(facet, -1, -2)
+    facet_rotated = np.flip(facet_transposed, -2)
     return facet_rotated
 
 
 def _facets_to_latlon_scalar(all_facets):
     rotated = (all_facets[:2]
                + [_rotate_scalar_facet(facet) for facet in all_facets[-2:]])
-    return dsa.concatenate(rotated, axis=3)
+    # drop facet dimension
+    rotated = [r[..., 0, :, :] for r in rotated]
+    return dsa.concatenate(rotated, axis=-1)
 
 
-def _facets_to_latlon_vector(facets_u, facets_v):
-    u_rot = (facets_u[:2]
-             + [_rotate_scalar_facet(facet) for facet in facets_v[-2:]])
-    v_rot = (facets_v[:2]
-             + [-_rotate_scalar_facet(facet) for facet in facets_u[-2:]])
-    u = dsa.concatenate(u_rot, axis=3)
-    v = dsa.concatenate(v_rot, axis=3)
+def _faces_to_latlon_scalar(data):
+    data_facets = _faces_to_facets(data)
+    return _facets_to_latlon_scalar(data_facets)
+
+
+# dask's pad function doesn't work
+# it does weird things to non-pad dimensions
+# need to roll our own
+def shift_and_pad(a):
+    a_shifted = a[..., 1:]
+    pad_array = dsa.zeros_like(a[..., -2:-1])
+    return dsa.concatenate([a_shifted, pad_array], axis=-1)
+
+def transform_v_to_u(facet):
+    return _rotate_scalar_facet(facet)
+
+def transform_u_to_v(facet, metric=False):
+    # "shift" u component by 1 pixel
+    pad_width = (facet.ndim - 1) * (None,) + ((1, 0),)
+    #facet_padded = dsa.pad(facet[..., 1:], pad_width, 'constant')
+    facet_padded = shift_and_pad(facet)
+    assert facet.shape == facet_padded.shape
+    facet_rotated = _rotate_scalar_facet(facet_padded)
+    if not metric:
+        facet_rotated = -facet_rotated
+    return facet_rotated
+
+def _facets_to_latlon_vector(facets_u, facets_v, metric=False):
+    # need to pad the rotated v values
+    ndim = facets_u[0].ndim
+    # second-to-last axis is the one to pad, plus a facet axis
+    assert ndim >= 3
+
+    # drop facet dimension
+    facets_u_drop = [f[..., 0, :, :] for f in facets_u]
+    facets_v_drop = [f[..., 0, :, :] for f in facets_v]
+
+    u_rot = (facets_u_drop[:2]
+             + [transform_v_to_u(facet) for facet in facets_v_drop[-2:]])
+    v_rot = (facets_v_drop[:2]
+             + [transform_u_to_v(facet) for facet in facets_u_drop[-2:]])
+
+    u = dsa.concatenate(u_rot, axis=-1)
+    v = dsa.concatenate(v_rot, axis=-1)
     return u, v
 
+def _faces_to_latlon_vector(u_faces, v_faces, metric=False):
+    u_facets = _faces_to_facets(u_faces)
+    v_facets = _faces_to_facets(v_faces)
+    u, v = _facets_to_latlon_vector(u_facets, v_facets, metric=metric)
+    return u, v
+
+def _drop_facedim(dims):
+    dims = list(dims)
+    dims.remove('face')
+    return dims
+
+def _faces_coords_to_latlon(ds):
+    coords = ds.reset_coords().coords.to_dataset()
+    ifac = 4
+    jfac = 3
+    dim_coords = {}
+    for vname in coords.coords:
+        if vname[0] == 'i':
+            data = np.arange(ifac * coords.dims[vname])
+        elif vname[0] == 'j':
+            data = np.arange(jfac * coords.dims[vname])
+        else:
+            data = coords[vname].data
+        var = xr.Variable(ds[vname].dims, data, ds[vname].attrs)
+        dim_coords[vname] = var
+    return xr.Dataset(dim_coords)
+
+def faces_dataset_to_latlon(ds, metric_vector_pairs=[('dxC', 'dyC'), ('dyG', 'dxG')]):
+    """Transform a 13-face LLC xarray Dataset into a rectancular grid,
+    discarding the Arctic.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        A 13-face LLC dataset
+    metric_vector_pairs : list, optional
+        Pairs of variables that are positive-definite metrics located at grid
+        edges.
+
+    Returns
+    -------
+    out : xarray.Dataset
+        Transformed rectangular dataset
+    """
+
+    coord_vars = list(ds.coords)
+    ds_new = _faces_coords_to_latlon(ds)
+
+    vector_pairs = []
+    scalars = []
+    vnames = list(ds.reset_coords().variables)
+    for vname in vnames:
+        try:
+            mate = ds[vname].attrs['mate']
+            vector_pairs.append((vname, mate))
+            vnames.remove(mate)
+        except KeyError:
+            pass
+
+    all_vector_components = [inner for outer in (vector_pairs + metric_vector_pairs)
+                             for inner in outer]
+    scalars = [vname for vname in vnames if vname not in all_vector_components]
+    data_vars = {}
+
+    for vname in scalars:
+        if vname=='face' or vname in ds_new:
+            continue
+        if 'face' in ds[vname].dims:
+            data = _faces_to_latlon_scalar(ds[vname].data)
+            dims = _drop_facedim(ds[vname].dims)
+        else:
+            data = ds[vname].data
+            dims = ds[vname].dims
+        data_vars[vname] = xr.Variable(dims, data, ds[vname].attrs)
+
+    for vname_u, vname_v in vector_pairs:
+        data_u, data_v = _faces_to_latlon_vector(ds[vname_u].data, ds[vname_v].data)
+        data_vars[vname_u] = xr.Variable(_drop_facedim(ds[vname_u].dims), data_u, ds[vname_u].attrs)
+        data_vars[vname_v] = xr.Variable(_drop_facedim(ds[vname_v].dims), data_v, ds[vname_v].attrs)
+    for vname_u, vname_v in metric_vector_pairs:
+        data_u, data_v = _faces_to_latlon_vector(ds[vname_u].data, ds[vname_v].data, metric=True)
+        data_vars[vname_u] = xr.Variable(_drop_facedim(ds[vname_u].dims), data_u, ds[vname_u].attrs)
+        data_vars[vname_v] = xr.Variable(_drop_facedim(ds[vname_v].dims), data_v, ds[vname_v].attrs)
+
+
+    ds_new = ds_new.update(data_vars)
+    ds_new = ds_new.set_coords([c for c in coord_vars if c in ds_new])
+    return ds_new
+
+
+# below are data transformers
+
+def _all_facets_to_faces(data_facets, meta):
+    return {vname: _facets_to_faces(data)
+            for vname, data in data_facets.items()}
+
+
+def _all_facets_to_latlon(data_facets, meta):
+
+    vector_pairs = []
+    scalars = []
+    vnames = list(data_facets)
+    for vname in vnames:
+        try:
+            mate = meta['attrs']['mate']
+            vector_pairs.append((vname, mate))
+            vnames.remove(mate)
+        except KeyError:
+            pass
+
+    all_vector_components = [inner for outer in vector_pairs for inner in outer]
+    scalars = [vname for vname in vnames if vname not in all_vector_components]
+
+    data = {}
+    for vname in scalars:
+        data[vname] = _facet_to_latlon_scalar(data_facets[vname])
+        
+    for vname_u, vname_v in vector_pairs:
+        data_u, data_v = _facet_to_latlon_vector(data_facets[vname_u],
+                                                 data_facets[vname_v])
+        data[vname_u] = data_u
+        data[vname_v] = data_v
+
+    return data
+
+
+######################### OLD BELOW #############################
 
 class _LLCDataRequest:
 
@@ -289,7 +454,12 @@ class BaseLLCModel:
         return xr.decode_cf(xr.Dataset(coords=coords))
 
 
-    def _get_facet_data(self, varname, iters, k=levels, type='faces'):
+    def _make_coords_latlon():
+        ds = self._make_coords_faces(self):
+        return _faces_coords_to_latlon(ds)
+
+
+    def _get_facet_data(self, varname, iters, k=levels):
         # look up metadata?
 
         mask, index = self.get_mask_and_index_for_variable(varname)
@@ -311,7 +481,7 @@ class BaseLLCModel:
         # concatenate over time
         data = dsa.concatenate(data_iters, axis=0)
 
-        meta = _VAR_METADATA[varname]
+
 
 
     def get_dataset(variables, iter_start=None, iter_stop=None,
@@ -337,23 +507,75 @@ class BaseLLCModel:
             Vertical levels to extract. Default is to get them all
         k_chunksize : int, optional
             How many vertical levels per Dask chunk.
+        type : {'faces', 'latlon'}, optional
+            What type of dataset to create
         """
 
         iters = np.arange(iter_start, iter_stop, iter_step)
 
-        ds = self._make_coords()
+        ds = self._make_coords_faces()
+        if type=='latlon':
+            ds = _faces_coords_to_lalon(ds)
+        coord_vars = list(ds.coords)
 
-        scalars = []
+        if varnames is None:
+            varnames = self.varnames
+
+        # get the data in facet form
+        data_facets = {vname:
+                       self._get_facet_data(vname, iters, k_levels, k_chunksize),
+                       for vname in varnames}
+
+        # transform it into faces or latlon
+        data_transformers = {'faces': _all_facets_to_faces,
+                             'latlon': _all_facets_to_latlon}
+
+        transformer = data_transformers[type]
+        data = transformer(data_facets, _VAR_METADATA)
+
+        if type=='faces':
+            data = _all_facets_to_faces(data_facets)
+        elif type=='latlon':
+
+
         vector_pairs = []
-        scalars, vector_pairs = _get_scalars_and_vectors(varnames, type)
+        scalars = []
+        for vname in varnames:
+            meta = _VAR_METADATA[varname]
+            if 'mate' in meta['attrs']:
+                mate = meta['attrs']['mate']
+                vector_pairs.append((vname, mate))
+                varnames.remove(mate)
+
+        all_vector_components = [inner for outer in (vector_pairs + metric_vector_pairs)
+                                 for inner in outer]
+        scalars = [vname for vname in vnames if vname not in all_vector_components]
+        data_vars = {}
 
         for vname in scalars:
-            facets =
+            if vname=='face' or vname in ds_new:
+                continue
+            if 'face' in ds[vname].dims:
+                data = _faces_to_latlon_scalar(ds[vname].data)
+                dims = _drop_facedim(ds[vname].dims)
+            else:
+                data = ds[vname].data
+                dims = ds[vname].dims
+            data_vars[vname] = xr.Variable(dims, data, ds[vname].attrs)
+
+        for vname_u, vname_v in vector_pairs:
+            data_u, data_v = _faces_to_latlon_vector(ds[vname_u].data, ds[vname_v].data)
+            data_vars[vname_u] = xr.Variable(_drop_facedim(ds[vname_u].dims), data_u, ds[vname_u].attrs)
+            data_vars[vname_v] = xr.Variable(_drop_facedim(ds[vname_v].dims), data_v, ds[vname_v].attrs)
+        for vname_u, vname_v in metric_vector_pairs:
+            data_u, data_v = _faces_to_latlon_vector(ds[vname_u].data, ds[vname_v].data, metric=True)
+            data_vars[vname_u] = xr.Variable(_drop_facedim(ds[vname_u].dims), data_u, ds[vname_u].attrs)
+            data_vars[vname_v] = xr.Variable(_drop_facedim(ds[vname_v].dims), data_v, ds[vname_v].attrs)
 
 
-        for vname in variables:
-            ds[vname] = self._make_data_variable(vname, iters, k=0)
-        return ds
+        ds_new = ds_new.update(data_vars)
+        ds_new = ds_new.set_coords([c for c in coord_vars if c in ds_new])
+        return ds_new
 
 class LLC4320Model(BaseLLCModel):
     nx = 4320
@@ -362,4 +584,4 @@ class LLC4320Model(BaseLLCModel):
     iter_stop = 1310544 + 1
     iter_step = 144
     time_units='seconds since 2011-09-10'
-    variables = ['']
+    varnames = ['']
