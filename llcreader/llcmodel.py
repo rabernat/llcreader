@@ -82,15 +82,18 @@ def _facet_shape(nfacet, nside):
     return facet_shape
 
 def _facet_to_faces(data, nfacet):
-    nz, nf, ny, nx = data.shape
+    shape = data.shape
+    # facet dimension
+    nf, ny, nx = shape[-3:]
+    other_dims = shape[:-3]
     assert nf == 1
     facet_length = _facet_strides[nfacet][1] - _facet_strides[nfacet][0]
     if _facet_reshape[nfacet]:
-        new_shape = nz, ny, facet_length, nx / facet_length
+        new_shape = other_dims +  (ny, facet_length, nx / facet_length)
         data_rs = data.reshape(new_shape)
-        data_rs = np.moveaxis(data_rs, 2, 1) # dask-safe
+        data_rs = np.moveaxis(data_rs, -2, -3) # dask-safe
     else:
-        new_shape = nz, facet_length, ny / facet_length, nx
+        new_shape = other_dims + (facet_length, ny / facet_length, nx)
         data_rs = data.reshape(new_shape)
     return data_rs
 
@@ -99,7 +102,7 @@ def _facets_to_faces(facets):
     for nfacet, data_facet in enumerate(facets):
         data_rs = _facet_to_faces(data_facet, nfacet)
         all_faces.append(data_rs)
-    return dsa.concatenate(all_faces, axis=1)
+    return dsa.concatenate(all_faces, axis=-3)
 
 def _faces_to_facets(data, facedim=-3):
     assert data.shape[facedim] == _nfaces
@@ -192,7 +195,7 @@ def _add_face_to_dims(dims):
     if 'j'in dims or 'j_g' in dims:
         new_dims = dims.copy()
         j_dim = dims.index('j')
-        new_dims.inset('face', j_dim)
+        new_dims.insert(j_dim, 'face')
         return new_dims
     else:
         return dims
@@ -290,7 +293,7 @@ def _all_facets_to_latlon(data_facets, meta):
     vnames = list(data_facets)
     for vname in vnames:
         try:
-            mate = meta['attrs']['mate']
+            mate = meta[vname]['attrs']['mate']
             vector_pairs.append((vname, mate))
             vnames.remove(mate)
         except KeyError:
@@ -301,23 +304,27 @@ def _all_facets_to_latlon(data_facets, meta):
 
     data = {}
     for vname in scalars:
-        data[vname] = _facet_to_latlon_scalar(data_facets[vname])
+        data[vname] = _facets_to_latlon_scalar(data_facets[vname])
 
     for vname_u, vname_v in vector_pairs:
-        data_u, data_v = _facet_to_latlon_vector(data_facets[vname_u],
-                                                 data_facets[vname_v])
+        data_u, data_v = _facets_to_latlon_vector(data_facets[vname_u],
+                                                  data_facets[vname_v])
         data[vname_u] = data_u
         data[vname_v] = data_v
 
     return data
 
+def _chunks(l, n):
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
 
 ######################### OLD BELOW #############################
 
 class _LLCDataRequest:
 
-    def __init__(self, fs, path, dtype, nk, nx,
-                 klevels=[0], index=None, mask=None):
+    def __init__(self, fs, path, dtype, nz, nx,
+                 klevels=[0], index=None, mask=None, k_chunksize=1):
         """Create numpy data from a file
 
         Parameters
@@ -344,14 +351,15 @@ class _LLCDataRequest:
         self.fs = fs
         self.path = path
         self.dtype = dtype
-        self.nk = nk
+        self.nz = nz
         self.nx = nx
         self.klevels = klevels
+        self.k_chunksize = k_chunksize
         self.mask = mask
         self.index = index
 
 
-    def build_facet_chunk(self, nfacet):
+    def build_facet_chunk(self, nfacet, klevels):
 
         assert (nfacet >= 0) & (nfacet < _nfacets)
 
@@ -363,16 +371,15 @@ class _LLCDataRequest:
         facet_shape = _facet_shape(nfacet, self.nx)
 
         level_data = []
-        for k in self.klevels:
-            assert (k >= 0) & (k < self.nk)
+        for k in klevels:
+            assert (k >= 0) & (k < self.nz)
 
             # figure out where in the file we have to read to get the data
             # for this level and facet
             if self.index:
-                i = np.ravel_multi_index((k, nfacet), (self.nk, _nfacets))
+                i = np.ravel_multi_index((k, nfacet), (self.nz, _nfacets))
                 start = self.index[i]
                 end = self.index[i+1]
-                print('start, end', start, end)
             else:
                 level_start = k * self.nx**2 * _nfaces
                 facet_start, facet_end = _uncompressed_facet_index(nfacet, self.nx)
@@ -397,10 +404,18 @@ class _LLCDataRequest:
         return np.concatenate(level_data, axis=0)
 
     def lazily_build_facet_chunk(self, nfacet):
-        facet_shape = _facet_shape(nfacet, self.nx)
-        shape = (len(self.klevels),) + facet_shape[1:]
-        return dsa.from_delayed(dask.delayed(self.build_facet_chunk)(nfacet),
-                                shape, self.dtype)
+        all_levels = []
+        for klevels in _chunks(self.klevels, self.k_chunksize):
+            facet_shape = _facet_shape(nfacet, self.nx)
+            shape = (len(klevels),) + facet_shape[1:]
+            delayed_func = dask.delayed(self.build_facet_chunk)(nfacet, klevels)
+            data_chunk =  dsa.from_delayed(delayed_func,
+                                           shape, self.dtype)
+            all_levels.append(data_chunk)
+        if len(all_levels)==1:
+            return all_levels[0]
+        else:
+            return dsa.concatenate(all_levels, axis=0)
 
     def facets(self):
         return [self.lazily_build_facet_chunk(nfacet) for nfacet in range(5)]
@@ -408,11 +423,10 @@ class _LLCDataRequest:
 
 
 class BaseLLCModel:
-    nz = 90
     nface = 13
     dtype = np.dtype('>f4')
 
-    def __init__(self, datastore, mask_ds):
+    def __init__(self, datastore, mask_ds=None):
         """Initialize model
 
         Parameters
@@ -423,7 +437,10 @@ class BaseLLCModel:
         """
         self.store = datastore
         self.shape = (self.nz, self.nface, self.nx, self.nx)
-        self.masks = self._get_masks(mask_ds)
+        if mask_ds:
+            self.masks = self._get_masks(mask_ds)
+        else:
+            self.masks = None
 
 
     def _get_masks(self, mask_ds, check=False):
@@ -439,6 +456,8 @@ class BaseLLCModel:
     def _make_coords_faces(self):
         all_iters = np.arange(self.iter_start, self.iter_stop, self.iter_step)
         time = self.delta_t * all_iters
+        time_attrs = {'units': self.time_units,
+                      'calendar': self.calendar}
         coords = {'face': ('face', np.arange(self.nface)),
                   'i': ('i', np.arange(self.nx)),
                   'i_g': ('i_g', np.arange(self.nx)),
@@ -449,34 +468,59 @@ class BaseLLCModel:
                   'k_l': ('k_l', np.arange(self.nz)),
                   'k_p1': ('k_p1', np.arange(self.nz + 1)),
                   'niter': ('time', all_iters),
-                  'time': ('time', time, {'units': mtime['units']})
+                  'time': ('time', time, time_attrs)
                  }
         return xr.decode_cf(xr.Dataset(coords=coords))
 
 
     def _make_coords_latlon():
-        ds = self._make_coords_faces(self):
+        ds = self._make_coords_faces(self)
         return _faces_coords_to_latlon(ds)
 
 
-    def _get_facet_data(self, varname, iters, k=levels):
-        mask, index = self.get_mask_and_index_for_variable(varname)
+    def _get_mask_and_index_for_variable(self, vname):
+        if self.masks is None:
+            return None, None
+
+        dims = _VAR_METADATA[vname]['dims']
+        if 'i' in dims and 'j' in dims:
+            point = 'C'
+        elif 'i_g' in dims and 'j' in dims:
+            point = 'W'
+        elif 'i' in dims and 'j_g' in dims:
+            point = 'S'
+        elif 'i_g' in dims and 'j_g' in dims:
+            raise ValueError("Don't have masks for corner points!")
+        else:
+            # this is not a 2D variable
+            return None, None
+
+        raise NotImplementedError("Haven't coded this part yet!")
+
+    def _get_facet_data(self, varname, iters, klevels, k_chunksize):
+        mask, index = self._get_mask_and_index_for_variable(varname)
         # needs facets to be outer index of nested lists
-        data_iters = 5 * [[],]
+        data_iters = [[] for i in range(5)]
+        dims = _VAR_METADATA[varname]['dims']
+        if len(dims)==2:
+            klevels = [0,]
         for iternum in iters:
-            fs, path = self.store.get_fs_and_full_path(self, varname, iternum)
-            dr = _LLCDataRequest(fs, path, self.dtype, self.nk, self.nx,
-                                 mask=mask, index=index, klevels=klevels)
+            fs, path = self.store.get_fs_and_full_path(varname, iternum)
+            dr = _LLCDataRequest(fs, path, self.dtype, self.nz, self.nx,
+                                 mask=mask, index=index, klevels=klevels,
+                                 k_chunksize=k_chunksize)
             data_facets = dr.facets()
             for n in range(5):
                 # insert a new axis for time at the beginning
-                data_iters[n].append(data_facets[n][None])
+                data = data_facets[n][None]
+                if len(dims)==2:
+                    # squeeze depth dimension out of 2D variable
+                    data = data[..., 0, :, :, :]
+                data_iters[n].append(data)
+        return [dsa.concatenate(facet, axis=0) for facet in data_iters]
 
-        data = [dsa.concatenate(facet, axis=0) for facet in data_iters]
-        return data
 
-
-    def get_dataset(variables, iter_start=None, iter_stop=None,
+    def get_dataset(self, varnames, iter_start=None, iter_stop=None,
                     iter_step=None, k_levels=None, k_chunksize=1,
                     type='faces'):
         """
@@ -503,18 +547,24 @@ class BaseLLCModel:
             What type of dataset to create
         """
 
+        iter_start = iter_start or self.iter_start
+        iter_stop = iter_stop or self.iter_stop
+        iter_step = iter_step or self.iter_step
+        varnames = varnames or self.varnames
+
         iters = np.arange(iter_start, iter_stop, iter_step)
 
         ds = self._make_coords_faces()
         if type=='latlon':
-            ds = _faces_coords_to_lalon(ds)
+            ds = _faces_coords_to_latlon(ds)
 
-        if varnames is None:
-            varnames = self.varnames
+        # todo - deal with 2D fields
+        k_levels = k_levels or np.arange(self.nz)
+        ds = ds.sel(k=k_levels, k_l=k_levels, k_u=k_levels, k_p1=k_levels)
 
         # get the data in facet form
         data_facets = {vname:
-                       self._get_facet_data(vname, iters, k_levels, k_chunksize),
+                       self._get_facet_data(vname, iters, k_levels, k_chunksize)
                        for vname in varnames}
 
         # transform it into faces or latlon
@@ -528,20 +578,34 @@ class BaseLLCModel:
         for vname in varnames:
             meta = _VAR_METADATA[vname]
             dims = meta['dims']
-            if type=='latlon':
-                dims = _add_face_to_dims[dims]
+            if type=='faces':
+                dims = _add_face_to_dims(dims)
+            dims = ['time',] + dims
             attrs = meta['attrs']
             variables[vname] = xr.Variable(dims, data[vname], attrs)
 
-        ds = ds.update(data_vars)
+        ds = ds.update(variables)
         return ds
+
+class LLC90Model(BaseLLCModel):
+    nx = 90
+    nz = 50
+    delta_t = 3600
+    iter_start = 0
+    iter_stop = 8 + 1
+    iter_step = 8
+    time_units = 'seconds since 1948-01-01 12:00:00'
+    calendar = 'gregorian'
+    varnames = ['S', 'T', 'U', 'V', 'PH', 'PHL', 'Eta']
 
 
 class LLC4320Model(BaseLLCModel):
     nx = 4320
+    nz = 90
     delta_t = 25
     iter_start = 10368
     iter_stop = 1310544 + 1
     iter_step = 144
     time_units='seconds since 2011-09-10'
+    calendar = 'gregorian'
     varnames = ['']
