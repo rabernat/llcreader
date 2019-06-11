@@ -3,7 +3,6 @@ import dask
 import dask.array as dsa
 import xarray as xr
 
-
 def _get_var_metadata():
     # The LLC run data comes with zero metadata. So we import metadata from
     # the xmitgcm package.
@@ -192,13 +191,14 @@ def _drop_facedim(dims):
     return dims
 
 def _add_face_to_dims(dims):
-    if 'j'in dims or 'j_g' in dims:
-        new_dims = dims.copy()
+    new_dims = dims.copy()
+    if 'j' in dims:
         j_dim = dims.index('j')
         new_dims.insert(j_dim, 'face')
-        return new_dims
-    else:
-        return dims
+    elif 'j_g' in dims:
+        j_dim = dims.index('j_g')
+        new_dims.insert(j_dim, 'face')
+    return new_dims
 
 def _faces_coords_to_latlon(ds):
     coords = ds.reset_coords().coords.to_dataset()
@@ -298,6 +298,7 @@ def _all_facets_to_latlon(data_facets, meta):
             vnames.remove(mate)
         except KeyError:
             pass
+    print(vector_pairs)
 
     all_vector_components = [inner for outer in vector_pairs for inner in outer]
     scalars = [vname for vname in vnames if vname not in all_vector_components]
@@ -437,24 +438,25 @@ class BaseLLCModel:
         """
         self.store = datastore
         self.shape = (self.nz, self.nface, self.nx, self.nx)
-        if mask_ds:
-            self.masks = self._get_masks(mask_ds)
+        if self.store.shrunk:
+            self.masks = self._get_masks()
+            from .shrunk_index import all_index_data
+            self.indexes = all_index_data[self.nx]
         else:
             self.masks = None
+            self.indexes = None
 
 
-    def _get_masks(self, mask_ds, check=False):
-        for point in ['C', 'W', 'S']:
-            # store mask data as a raw array, not xarray object, to avoid any
-            # alignment overhead
-            data = mask_da['mask' + point].data
-            assert data.dtype == np.bool
-            assert data.shape == self.shape
-            self.masks[point] = data
+    def _get_masks(self):
+        masks = {}
+        zgroup = self.store.open_mask_group()
+        for point in ['c', 'w', 's']:
+            mask_faces = dsa.from_zarr(zgroup['mask_' + point]).astype('bool')
+            masks[point] = _faces_to_facets(mask_faces)
+        return masks
 
 
-    def _make_coords_faces(self):
-        all_iters = np.arange(self.iter_start, self.iter_stop, self.iter_step)
+    def _make_coords_faces(self, all_iters):
         time = self.delta_t * all_iters
         time_attrs = {'units': self.time_units,
                       'calendar': self.calendar}
@@ -484,18 +486,21 @@ class BaseLLCModel:
 
         dims = _VAR_METADATA[vname]['dims']
         if 'i' in dims and 'j' in dims:
-            point = 'C'
+            point = 'c'
         elif 'i_g' in dims and 'j' in dims:
-            point = 'W'
+            point = 'w'
         elif 'i' in dims and 'j_g' in dims:
-            point = 'S'
+            point = 's'
         elif 'i_g' in dims and 'j_g' in dims:
             raise ValueError("Don't have masks for corner points!")
         else:
             # this is not a 2D variable
             return None, None
-
-        raise NotImplementedError("Haven't coded this part yet!")
+        
+        mask = self.masks[point]
+        index = self.indexes[point]
+        return mask, index
+    
 
     def _get_facet_data(self, varname, iters, klevels, k_chunksize):
         mask, index = self._get_mask_and_index_for_variable(varname)
@@ -554,11 +559,10 @@ class BaseLLCModel:
 
         iters = np.arange(iter_start, iter_stop, iter_step)
 
-        ds = self._make_coords_faces()
+        ds = self._make_coords_faces(iters)
         if type=='latlon':
             ds = _faces_coords_to_latlon(ds)
 
-        # todo - deal with 2D fields
         k_levels = k_levels or np.arange(self.nz)
         ds = ds.sel(k=k_levels, k_l=k_levels, k_u=k_levels, k_p1=k_levels)
 
