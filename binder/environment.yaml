@@ -1,0 +1,7 @@
+name: pangeo
+channels:
+  - conda-forge
+dependencies:
+  - pip
+    - xmitgcm
+    - git+https://github.com/martindurant/filesystem_spec.git
