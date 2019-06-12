@@ -298,7 +298,6 @@ def _all_facets_to_latlon(data_facets, meta):
             vnames.remove(mate)
         except KeyError:
             pass
-    print(vector_pairs)
 
     all_vector_components = [inner for outer in vector_pairs for inner in outer]
     scalars = [vname for vname in vnames if vname not in all_vector_components]
@@ -496,11 +495,11 @@ class BaseLLCModel:
         else:
             # this is not a 2D variable
             return None, None
-        
+
         mask = self.masks[point]
         index = self.indexes[point]
         return mask, index
-    
+
 
     def _get_facet_data(self, varname, iters, klevels, k_chunksize):
         mask, index = self._get_mask_and_index_for_variable(varname)
